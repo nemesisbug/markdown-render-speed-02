@@ -4,7 +4,7 @@
 
 # fast-markdown
 
-A dependency-free, from-scratch CommonMark 0.31.2 + GFM 0.29 parser written for speed: it renders exactly the HTML marked 18.1.3 produces, but faster, with no dependencies and no lookup tables.
+A dependency-free, from-scratch CommonMark 0.31.2 + GFM 0.29 renderer built for speed. It returns exactly the HTML marked 18.1.3 produces with its default options, but runs faster, with no dependencies, no WASM, and no cross-document caching.
 
 ## Run
 
@@ -16,7 +16,7 @@ MAKEFUN_INPUT_DIR=./input MAKEFUN_OUTPUT_DIR=./output node main.ts
 
 ## How it works
 
-`parse.js` is a single ES module with three stages:
+`parse.js` is a single ES module in three stages:
 
 - **Block parsing** — a line-based, tab-aware parser: ATX and setext headings, paragraphs, fenced and indented code, blockquotes (with lazy continuation), lists (tight/loose, task lists), GFM tables, thematic breaks, and HTML blocks of all seven CommonMark types.
 - **Inline parsing** — backslash escapes, code spans, numeric entities, the delimiter-stack algorithm for emphasis, strong and strikethrough, inline and reference links and images, autolinks and GFM extended autolinks (bare URLs and emails), and raw HTML.
