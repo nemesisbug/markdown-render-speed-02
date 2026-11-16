@@ -683,6 +683,13 @@ function blockParse(src) {
   function processLine(raw, lineIdx, nextIsBlank) {
     const cur = { s: raw, i: 0, col: 0, partial: 0 };
     let lineMatchedQuote = false;
+    // Whether the next line is empty (zero characters). This is not
+    // the same as blank: a line of only spaces or tabs still counts as
+    // following content for an HTML block's trailing newline -- only a
+    // truly empty line suppresses it (`<!-- hi -->\n \nPara.` keeps
+    // the newline, `<!-- hi -->\n\nPara.` does not).
+    const nextIsEmpty =
+      lineIdx + 1 < rawLines.length && rawLines[lineIdx + 1] === '';
 
     // 1. Match open containers.
     let container = doc;
@@ -794,6 +801,26 @@ function blockParse(src) {
         tip.lazyPrevGt = lineMatchedQuote;
         return;
       }
+      // A line of only spaces plus a single tab (`\t`, ` \t`, `  \t`,
+      // `   \t`) inside a paragraph that already holds a table header
+      // and delimiter is a table row of empty cells, not a blank line:
+      // the reference keeps the table open and renders the row, while
+      // a spaces-only or empty line ends the table. (For a paragraph
+      // that is not a table, the same line still ends the paragraph.)
+      if (
+        tip !== doc &&
+        tip.t === 'paragraph' &&
+        /^ {0,3}\t$/.test(curRest(cur)) &&
+        findTableStart(tip.lines) >= 0
+      ) {
+        if (tip.lazyRun) {
+          tip.lines.push('');
+          tip.lazyRun = false;
+        }
+        tip.lines.push(curRest(cur));
+        tip.lazyPrevGt = lineMatchedQuote;
+        return;
+      }
       // An empty `>` line does not set `blankPending`: it is an empty
       // line inside the quote, not a blank line between blocks — except
       // when it ends a paragraph that is a direct child of a list item,
@@ -811,7 +838,10 @@ function blockParse(src) {
       // A blank line that does not match a `>` closes the enclosing
       // blockquote and everything inside it: a blank line inside an
       // indented code block in a quote is not code content, and a
-      // paragraph in the quote ends with the quote.
+      // paragraph in the quote ends with the quote. This holds even
+      // when a list sits between the tip and the quote: a blank line
+      // after `> - a` ends the list and the quote, so a later `>` line
+      // opens a fresh blockquote instead of continuing the old one.
       let closedQuote = false;
       if (!lineMatchedQuote) {
         let node = tip;
@@ -821,7 +851,6 @@ function blockParse(src) {
             closedQuote = true;
             break;
           }
-          if (node.t === 'list' || node.t === 'item') break;
           node = node.parent;
         }
       }
@@ -831,9 +860,11 @@ function blockParse(src) {
           tip = tip.parent;
           finalize(b);
         } else if (tip !== doc && tip.t === 'code' && tip.fenced) {
-          // A whitespace-only line is content: keep it (minus the fence
-          // indent), so `` ```\n\n  \n``` `` renders `\n  \n`.
-          tip.lines.push(stripIndent(curRest(cur), tip.fenceIndent, cur.col));
+          // A whitespace-only line is content: keep it, stripping the
+          // opening fence's indent only for a backtick fence (a tilde
+          // fence keeps its content's full indent, as the reference
+          // does), so `` ```\n\n  \n``` `` renders `\n  \n`.
+          tip.lines.push(stripIndent(curRest(cur), tip.fenceCh === '`' ? tip.fenceIndent : 0, cur.col));
         } else if (tip !== doc && tip.t === 'code' && !tip.fenced) {
           // A whitespace-only line keeps the spaces beyond the 4-column
           // indent (`      ` inside indented code is `  `, not empty).
@@ -928,15 +959,22 @@ function blockParse(src) {
           }
           // A lazy line inside a list item loses its leading whitespace
           // up to the item's content indent (`    - e` in an item with
-          // content indent 5 becomes `- e`).
-          let anc = tip.parent;
-          while (anc && anc !== doc) {
-            if (anc.t === 'item') {
-              const strip = curMeasureIndent(cur, anc.contentIndent);
-              if (strip > 0) curAdvance(cur, strip);
-              break;
+          // content indent 5 becomes `- e`). But only when the item did
+          // not already match (its indent is already consumed, so
+          // stripping again would eat paragraph text) and only when the
+          // line did not match a `>` (after `> `, the remaining space
+          // is paragraph content, not item indent).
+          if (!lineMatchedQuote) {
+            let anc = tip.parent;
+            while (anc && anc !== doc) {
+              if (anc === container) break;
+              if (anc.t === 'item') {
+                const strip = curMeasureIndent(cur, anc.contentIndent);
+                if (strip > 0) curAdvance(cur, strip);
+                break;
+              }
+              anc = anc.parent;
             }
-            anc = anc.parent;
           }
           let lineText = curRest(cur);
           // A lazy setext underline that is a direct child of a blockquote
@@ -993,7 +1031,13 @@ function blockParse(src) {
               return;
             }
             const line = curRest(cur);
-            tip.lines.push(stripIndent(line, tip.fenceIndent, cur.col));
+            // The opening fence's indent is removed from content lines
+            // only for a backtick fence: a tilde fence keeps its
+            // content's full indent once container markers are
+            // consumed (the reference strips backtick fences and not
+            // tilde ones), so strip conditionally here and let
+            // stripIndent only expand a leading tab from its column.
+            tip.lines.push(stripIndent(line, tip.fenceCh === '`' ? tip.fenceIndent : 0, cur.col));
             blankPending = false;
             return;
           }
@@ -1018,7 +1062,7 @@ function blockParse(src) {
             tip.lastLineIdx = lineIdx;
             if (tip.kind === 1 && htmlBlockEnds(line, 1, tip.end)) {
               tip.endedAtMarker = true;
-              tip.followedByBlank = lineIdx < lastLineIdx && nextIsBlank;
+              tip.followedByBlank = lineIdx < lastLineIdx && nextIsEmpty;
               const b = tip;
               tip = tip.parent;
               finalize(b);
@@ -1028,7 +1072,7 @@ function blockParse(src) {
               htmlBlockEnds(line, tip.kind, tip.end)
             ) {
               tip.endedAtMarker = true;
-              tip.followedByBlank = lineIdx < lastLineIdx && nextIsBlank;
+              tip.followedByBlank = lineIdx < lastLineIdx && nextIsEmpty;
               const b = tip;
               tip = tip.parent;
               finalize(b);
@@ -1138,7 +1182,7 @@ function blockParse(src) {
       tip = node;
       if (html.kind === 1 && htmlBlockEnds(startLine, 1, html.end)) {
         node.endedAtMarker = true;
-        node.followedByBlank = lineIdx < lastLineIdx && nextIsBlank;
+        node.followedByBlank = lineIdx < lastLineIdx && nextIsEmpty;
         tip = tip.parent;
         finalize(node);
       } else if (
@@ -1147,7 +1191,7 @@ function blockParse(src) {
         htmlBlockEnds(startLine, html.kind, html.end)
       ) {
         node.endedAtMarker = true;
-        node.followedByBlank = lineIdx < lastLineIdx && nextIsBlank;
+        node.followedByBlank = lineIdx < lastLineIdx && nextIsEmpty;
         tip = tip.parent;
         finalize(node);
       }
@@ -1325,6 +1369,11 @@ function blockParse(src) {
 }
 
 // Remove up to `n` columns of leading whitespace from a line string.
+// A tab counts as a single column of the strip and is dropped whole:
+// marked strips a fence indent of 2 from `\tfoo` as `foo`, not `  foo`
+// (a tab is not partially consumed the way a column advance would).
+// `col` still tracks the absolute column (a consumed tab advances it by
+// its display width) so a tab that survives the strip expands correctly.
 function stripIndent(line, n, startCol) {
   let i = 0;
   let col = startCol || 0;
@@ -1336,12 +1385,9 @@ function stripIndent(line, n, startCol) {
       n--;
     } else if (ch === '\t') {
       const w = 4 - (col % 4);
-      if (w > n) {
-        return ' '.repeat(w - n) + line.slice(i + 1);
-      }
       i++;
       col += w;
-      n -= w;
+      n--;
     } else break;
   }
   // Inside a container (startCol > 0) a leading tab is expanded to
@@ -2061,6 +2107,185 @@ function processEmphasis(nodes, delims) {
 let inAnchor = false;
 
 // The main inline scan. Returns the parsed node list.
+// Analyze the backtick runs in s[from:to] for link closing. Returns:
+// - count: the number of backtick runs acting as delimiters (an escaped
+//   run counts only while a code span is open, i.e. while the count so
+//   far is odd -- `[a \`b c]` has none, `[a `b\` c]` has two).
+// - spanClosesAtEnd: true when a code span whose content holds a
+//   backtick closes exactly at `to` (its closing run ends at `to`).
+//   Such a span lets the `]` close the link even when the count is odd
+//   (`[for table `` a ` b ``][29]`), while any text between that span
+//   and the `]` blocks it (`[a ``b` c`` d](u)` does not link).
+// A link may close only when count is even or spanClosesAtEnd is true.
+function analyzeBackticks(s, from, to) {
+  // Collect the runs: start, length, and whether escaped.
+  const runs = [];
+  let k = from;
+  while (k < to) {
+    if (s[k] !== '`') {
+      k++;
+      continue;
+    }
+    let b = k - 1;
+    let slashes = 0;
+    while (b >= from && s[b] === '\\') {
+      slashes++;
+      b--;
+    }
+    let r = 0;
+    while (k + r < to && s[k + r] === '`') r++;
+    runs.push({ start: k, len: r, escaped: slashes % 2 === 1 });
+    k += r;
+  }
+  // Delimiter count: an escaped run counts only while a span is open.
+  let count = 0;
+  for (const run of runs) {
+    if (!(run.escaped && count % 2 === 0)) count++;
+  }
+  // Pair runs into code spans (an escaped run never opens one, but it
+  // can close one) and note whether a span holding a backtick closes
+  // exactly at `to`.
+  const consumed = new Array(runs.length).fill(false);
+  let spanClosesAtEnd = false;
+  for (let a = 0; a < runs.length; a++) {
+    if (consumed[a] || runs[a].escaped) continue;
+    let match = -1;
+    for (let c = a + 1; c < runs.length; c++) {
+      if (!consumed[c] && runs[c].len === runs[a].len) {
+        match = c;
+        break;
+      }
+    }
+    if (match < 0) continue;
+    for (let c = a; c <= match; c++) consumed[c] = true;
+    // The span holds a backtick when a run sits between opener/closer.
+    if (match > a + 1 && runs[match].start + runs[match].len === to) {
+      spanClosesAtEnd = true;
+    }
+  }
+  return { count, spanClosesAtEnd };
+}
+
+// Try to resolve a link closed by the `]` at `i` for `bracket`.
+// Returns { dest, title, endIdx } when a link forms (inline tail,
+// full / collapsed reference, or shortcut reference), else null.
+// The caller checks backtick parity first; this only resolves.
+function resolveLinkAt(s, i, bracket, refs) {
+  const n = s.length;
+  let link = null;
+  let endIdx = i + 1;
+  if (i + 1 < n && s[i + 1] === '(') {
+    const tail = parseInlineLinkTail(s, i + 1);
+    if (tail) {
+      link = { dest: tail.dest, title: tail.title };
+      endIdx = tail.end;
+    }
+  }
+  let hadLabelBracket = false;
+  let labelWellFormed = false;
+  if (!link && i + 1 < n && s[i + 1] === '[') {
+    hadLabelBracket = true;
+    // Full / collapsed reference. A label holds no unescaped `[`
+    // (that makes the reference invalid), and a backslash stays part
+    // of the label, so `[bar][foo\!]` does not match `[foo!]: /url`.
+    let j = i + 2;
+    let label = '';
+    let ok = false;
+    while (j < n) {
+      const c = s[j];
+      if (c === '\\' && j + 1 < n && isAsciiPunctCh(s[j + 1])) {
+        label += c + s[j + 1];
+        j += 2;
+      } else if (c === '[') {
+        break;
+      } else if (c === ']') {
+        ok = true;
+        j++;
+        break;
+      } else if (c === '\n') {
+        label += ' ';
+        j++;
+      } else {
+        label += c;
+        j++;
+      }
+    }
+    if (ok) {
+      labelWellFormed = true;
+      let norm = normalizeLabel(label);
+      if (norm === '') {
+        // Collapsed reference: the label is the link text itself,
+        // as raw source text (backslashes and markers kept).
+        norm = normalizeLabel(s.slice(bracket.contentStart, i));
+      }
+      const ref = refs.get(norm);
+      if (ref) {
+        link = { dest: ref.dest, title: ref.title };
+        endIdx = j;
+      }
+    }
+  }
+  if (!link && (!hadLabelBracket || !labelWellFormed)) {
+    // Shortcut reference: the label is the link text as raw source
+    // text (backslashes and emphasis markers kept), so `[*foo*]`
+    // only matches a `[*foo*]` definition and `[foo\!]` does not
+    // match `[foo!]`. A well-formed `[label]` that failed to match
+    // above is a full reference attempt, not a shortcut: `[foo]`
+    // in `[foo][bar][baz]` stays literal.
+    const norm = normalizeLabel(s.slice(bracket.contentStart, i));
+    if (norm !== '') {
+      const ref = refs.get(norm);
+      if (ref) {
+        link = { dest: ref.dest, title: ref.title };
+        endIdx = i + 1;
+      }
+    }
+  }
+  if (!link) return null;
+  return { dest: link.dest, title: link.title, endIdx };
+}
+
+// Should a bare autolink (extended URL or email) at position `i` be
+// suppressed because it sits inside a link's text? A link's text
+// suppresses autolinks -- but only while the text is still clean: once
+// a `]` has appeared inside the bracket's text (swallowed by a code
+// span or an angle autolink, an escaped `]`, or a `]` that failed
+// backtick parity), the bracket's closer was never a real closer, the
+// text is no longer a clean link text, and autolinks may form in it.
+// If a link later closes around such an autolink, it is unwrapped to
+// plain text (see unwrapBareLinks). Suppression holds only when some
+// active non-image bracket exists and none of them holds a `]` yet.
+function autolinkSuppressed(s, i, brackets) {
+  let anyActive = false;
+  for (const b of brackets) {
+    if (b.image || !b.active) continue;
+    anyActive = true;
+    const closeIdx = s.indexOf(']', b.contentStart);
+    if (closeIdx !== -1 && closeIdx < i) return false;
+  }
+  return anyActive;
+}
+
+// A link cannot contain a bare autolink: when a link forms around text
+// that already holds one (it formed because a `]` in the bracket's
+// text disabled suppression), unwrap the inner link to its plain text,
+// recursing into emphasis and other wrappers. Angle-bracket autolinks
+// are left alone -- marked keeps them nested (`[a <http://x.com> b](u)`
+// renders a link inside a link).
+function unwrapBareLinks(nodes) {
+  const out = [];
+  for (const node of nodes) {
+    if (node.k === 'link' && node.bare) {
+      out.push(...unwrapBareLinks(node.children));
+    } else if (node.children) {
+      out.push({ ...node, children: unwrapBareLinks(node.children) });
+    } else {
+      out.push(node);
+    }
+  }
+  return out;
+}
+
 function parseInline(s, refs) {
   const nodes = [];
   const delims = [];
@@ -2125,10 +2350,21 @@ function parseInline(s, refs) {
     if (ch === '`') {
       let run = 0;
       while (i + run < n && s[i + run] === '`') run++;
-      // Find a matching run of the same length.
+      // Find a matching run of the same length. The scan must not
+      // cross a `]` that closes a link whose text holds this run:
+      // the link wins, so `[a ``b` c](url) and ``d`` later` links
+      // `a ``b` c` and leaves ``d`` a code span, instead of swallowing
+      // the `]` into a code span. A `]` only blocks the scan when it
+      // closes the bracket this run sits inside (a bracket opened
+      // before the run) and a link would form there: even backtick
+      // parity in the link text, and a resolving tail or reference.
+      // A `]` closing a bracket opened after the run, or one with no
+      // link behind it, is crossed freely (`` `code [link](url)` ``
+      // stays one code span, and a `]` with no tail is just text).
       let j = i + run;
       let matchEnd = -1;
       let contentEnd = -1;
+      let blocked = false;
       while (j < n) {
         if (s[j] === '`') {
           let r2 = 0;
@@ -2139,11 +2375,34 @@ function parseInline(s, refs) {
             break;
           }
           j += r2;
+        } else if (s[j] === ']') {
+          const top =
+            brackets.length > 0 ? brackets[brackets.length - 1] : null;
+          // The `]` may close the link when the link text holds an
+          // even backtick count or ends exactly at the close of a code
+          // span whose content holds a backtick. When it may, the
+          // backtick run is literal: forming the span would swallow
+          // the `]` and lose the link.
+          const bt = top
+            ? analyzeBackticks(s, top.contentStart, j)
+            : null;
+          if (
+            top &&
+            top.active &&
+            top.contentStart < i &&
+            bt &&
+            (bt.count % 2 === 0 || bt.spanClosesAtEnd) &&
+            resolveLinkAt(s, j, top, refs)
+          ) {
+            blocked = true;
+            break;
+          }
+          j++;
         } else {
           j++;
         }
       }
-      if (matchEnd < 0) {
+      if (blocked || matchEnd < 0) {
         i += run;
         continue;
       }
@@ -2249,76 +2508,29 @@ function parseInline(s, refs) {
         i++;
         continue;
       }
+      // Backtick parity: the link text must hold an even number of
+      // backtick runs, or the `]` must sit exactly at the close of a
+      // code span whose content holds a backtick. An odd count means
+      // this `]` sits inside a code span opened by the unmatched run
+      // (`[a `b` c` d](url)` has three runs, so no link forms), while
+      // an even count lets the link form (`[a ``b` c](url)` has two).
+      // A span that ends at the `]` also lets the link form even with
+      // an odd count (`[for table `` a ` b ``][29]` links), but any
+      // text between that span and the `]` blocks it
+      // (`[a ``b` c`` d](url)` does not link). This covers inline,
+      // full / collapsed / shortcut references, and images alike.
+      // A `]` that fails here is literal text, but the bracket stays
+      // open: the `]` was never a real closer, so a later `]`
+      // outside the code span can still close the bracket
+      // (`[a `b` c` d](url) ``e g](url2)` links at the second `]`).
+      const bt = analyzeBackticks(s, bracket.contentStart, i);
+      if (bt.count % 2 === 1 && !bt.spanClosesAtEnd) {
+        textStart = i;
+        i++;
+        continue;
+      }
       // Try to form a link.
-      let link = null;
-      let endIdx = i + 1;
-      if (i + 1 < n && s[i + 1] === '(') {
-        const tail = parseInlineLinkTail(s, i + 1);
-        if (tail) {
-          link = { dest: tail.dest, title: tail.title };
-          endIdx = tail.end;
-        }
-      }
-      let hadLabelBracket = false;
-      let labelWellFormed = false;
-      if (!link && i + 1 < n && s[i + 1] === '[') {
-        hadLabelBracket = true;
-        // Full / collapsed reference. A label holds no unescaped `[`
-        // (that makes the reference invalid), and a backslash stays part
-        // of the label, so `[bar][foo\!]` does not match `[foo!]: /url`.
-        let j = i + 2;
-        let label = '';
-        let ok = false;
-        while (j < n) {
-          const c = s[j];
-          if (c === '\\' && j + 1 < n && isAsciiPunctCh(s[j + 1])) {
-            label += c + s[j + 1];
-            j += 2;
-          } else if (c === '[') {
-            break;
-          } else if (c === ']') {
-            ok = true;
-            j++;
-            break;
-          } else if (c === '\n') {
-            label += ' ';
-            j++;
-          } else {
-            label += c;
-            j++;
-          }
-        }
-        if (ok) {
-          labelWellFormed = true;
-          let norm = normalizeLabel(label);
-          if (norm === '') {
-            // Collapsed reference: the label is the link text itself,
-            // as raw source text (backslashes and markers kept).
-            norm = normalizeLabel(s.slice(bracket.contentStart, i));
-          }
-          const ref = refs.get(norm);
-          if (ref) {
-            link = { dest: ref.dest, title: ref.title };
-            endIdx = j;
-          }
-        }
-      }
-      if (!link && (!hadLabelBracket || !labelWellFormed)) {
-        // Shortcut reference: the label is the link text as raw source
-        // text (backslashes and emphasis markers kept), so `[*foo*]`
-        // only matches a `[*foo*]` definition and `[foo\!]` does not
-        // match `[foo!]`. A well-formed `[label]` that failed to match
-        // above is a full reference attempt, not a shortcut: `[foo]`
-        // in `[foo][bar][baz]` stays literal.
-        const norm = normalizeLabel(s.slice(bracket.contentStart, i));
-        if (norm !== '') {
-          const ref = refs.get(norm);
-          if (ref) {
-            link = { dest: ref.dest, title: ref.title };
-            endIdx = i + 1;
-          }
-        }
-      }
+      const link = resolveLinkAt(s, i, bracket, refs);
       if (!link) {
         // No link: the ']' is literal text and the bracket is spent.
         brackets.pop();
@@ -2326,6 +2538,7 @@ function parseInline(s, refs) {
         i++;
         continue;
       }
+      const endIdx = link.endIdx;
       // Form the link / image.
       const bracketIdx = nodeIndexOf(bracket.node);
       const children = nodes.slice(bracketIdx + 1);
@@ -2351,7 +2564,7 @@ function parseInline(s, refs) {
           k: 'link',
           href: link.dest,
           title: link.title,
-          children,
+          children: unwrapBareLinks(children),
         };
       }
       nodes.splice(bracketIdx, nodes.length - bracketIdx, linkNode);
@@ -2455,7 +2668,7 @@ function parseInline(s, refs) {
     if (
       (isWww || isHttp) &&
       !inAnchor &&
-      !brackets.some((b) => !b.image && b.active) &&
+      !autolinkSuppressed(s, i, brackets) &&
       (i === 0 ||
         s[i - 1] === ' ' ||
         s[i - 1] === '\t' ||
@@ -2472,6 +2685,7 @@ function parseInline(s, refs) {
         const href = s.startsWith('www.', i) ? 'http://' + url : url;
         nodes.push({
           k: 'link',
+          bare: true,
           href,
           title: null,
           children: [{ k: 'text', s: url }],
@@ -2488,7 +2702,7 @@ function parseInline(s, refs) {
       isLocalPartCh(ch) &&
       (i === 0 || !isLocalPartCh(s[i - 1])) &&
       !inAnchor &&
-      !brackets.some((b) => !b.image && b.active)
+      !autolinkSuppressed(s, i, brackets)
     ) {
       const hasOpenUnderscore = delims.some(
         (d) => d.ch === '_' && d.canOpen && d.len > 0
@@ -2498,6 +2712,7 @@ function parseInline(s, refs) {
         flushText(i);
         nodes.push({
           k: 'link',
+          bare: true,
           href: schemeLink,
           title: null,
           children: [{ k: 'text', s: schemeLink }],
@@ -2517,6 +2732,7 @@ function parseInline(s, refs) {
         flushText(i);
         nodes.push({
           k: 'link',
+          bare: true,
           href: 'mailto:' + m[0],
           title: null,
           children: [{ k: 'text', s: m[0] }],
@@ -2536,6 +2752,24 @@ function parseInline(s, refs) {
 
 // Scan a bare URL for an extended autolink starting at `i`. Returns the
 // URL (after paren handling and trailing-punctuation trimming) or ''.
+// Scan an extended autolink (`www.` / `scheme://...`) starting at `i`.
+// Returns the link text, or '' when no link starts here.
+//
+// The candidate runs to the next whitespace or `<`. Its tail is then
+// cleaned in a loop until nothing more changes, because each step can
+// expose the next problem (`...option).` loses the `.` first, and only
+// then the `)` that the `.` was hiding):
+//   1. trailing punctuation `? ! . , : * _ ~ (` and a trailing `;`
+//      (or a whole trailing entity reference) are not part of the link;
+//   2. parentheses are judged from the LAST `(` in the candidate:
+//      - no `(` at all: every trailing `)` is dropped;
+//      - the last `(` has no `)` after it: the link ends before it;
+//      - the last `(` is closed by some `)` later: any `)` after that
+//        closing one is dropped (`a(b))` becomes `a(b)`, and the
+//        nested `bar((baz))` becomes `bar((baz)` -- the final `)` is
+//        past the match of the last `(`).
+// An interior unmatched `)` does not affect the judgement (`a)b(c)`
+// keeps its final `)`, which closes the last `(`).
 function scanExtendedUrl(s, i) {
   const n = s.length;
   let j = i;
@@ -2544,35 +2778,40 @@ function scanExtendedUrl(s, i) {
   }
   let url = s.slice(i, j);
   if (url === '') return '';
-  // Paren handling.
+  for (;;) {
+    const before = url;
+    url = trimExtendedUrlTail(url);
+    url = trimUnbalancedParens(url);
+    if (url === '' || url === before) break;
+  }
+  return url;
+}
+
+// One parentheses pass over a candidate autolink, judged from its last
+// `(` (see scanExtendedUrl). Returns the shortened candidate.
+function trimUnbalancedParens(url) {
   const lastOpen = url.lastIndexOf('(');
   if (lastOpen < 0) {
-    url = url.replace(/\)+$/, '');
-  } else {
-    // Find the ')' matching the last '(' (scan forward with depth).
-    let depth = 0;
-    let matchIdx = -1;
-    for (let k = lastOpen; k < url.length; k++) {
-      if (url[k] === '(') depth++;
-      else if (url[k] === ')') {
-        depth--;
-        if (depth === 0) {
-          matchIdx = k;
-          break;
-        }
+    let end = url.length;
+    while (end > 0 && url[end - 1] === ')') end--;
+    return url.slice(0, end);
+  }
+  let depth = 0;
+  let matchIdx = -1;
+  for (let k = lastOpen; k < url.length; k++) {
+    if (url[k] === '(') depth++;
+    else if (url[k] === ')') {
+      depth--;
+      if (depth === 0) {
+        matchIdx = k;
+        break;
       }
     }
-    if (matchIdx < 0) {
-      url = url.slice(0, lastOpen);
-    } else {
-      // Remove trailing ')'s after the matching ')'.
-      let end = url.length;
-      while (end > matchIdx + 1 && url[end - 1] === ')') end--;
-      url = url.slice(0, end);
-    }
   }
-  if (url === '') return '';
-  return trimExtendedUrlTail(url);
+  if (matchIdx < 0) return url.slice(0, lastOpen);
+  let end = url.length;
+  while (end > matchIdx + 1 && url[end - 1] === ')') end--;
+  return url.slice(0, end);
 }
 
 // Trailing-punctuation trim for extended autolinks.
